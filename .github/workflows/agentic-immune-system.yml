@@ -1,0 +1,125 @@
+name: Agentic Immune System - Red Team
+on: 
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  adversarial-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Execute Red Team Interrogation
+        env:
+          PRIMARY_API_KEY: ${{ secrets.PRIMARY_API_KEY }}
+          FALLBACK_API_KEY: ${{ secrets.FALLBACK_API_KEY }}
+          BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          cat << 'EOF' > red_team.py
+          import os, sys, json, time, random, urllib.request, urllib.error, subprocess
+
+          # 1. Gather the PR Diff
+          base_ref = os.environ.get("BASE_REF")
+          try:
+              subprocess.run(["git", "fetch", "origin", os.environ.get("GITHUB_BASE_REF")], check=True, capture_output=True)
+              diff_process = subprocess.run(["git", "diff", f"{base_ref}...HEAD"], check=True, capture_output=True, text=True)
+              diff_content = diff_process.stdout
+          except Exception as e:
+              print(f"::error::Failed to gather git diff: {e}")
+              sys.exit(1)
+
+          if not diff_content.strip():
+              print("No changes detected. Passing.")
+              sys.exit(0)
+
+          # 2. Construct the Payload
+          system_prompt = """
+          You are a ruthless Principal Security Engineer. Your ONLY objective is to find critical vulnerabilities, race conditions, or logic flaws in the provided git diff.
+          You MUST respond in strict JSON format: {"is_vulnerable": boolean, "severity": number, "reasoning": "string"}
+          If you find a system-breaking flaw, set is_vulnerable to true.
+          """
+          
+          messages = [
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": f"Review this diff:\n\n{diff_content}"}
+          ]
+          
+          payload = {"model": "gemini-2.0-flash", "response_format": {"type": "json_object"}, "messages": messages}
+
+          # 3. Routing Engine (Primary with Backoff)
+          primary_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+          primary_key = os.environ.get("PRIMARY_API_KEY")
+          fallback_url = "https://openrouter.ai/api/v1/chat/completions"
+          fallback_key = os.environ.get("FALLBACK_API_KEY")
+          
+          llm_output = None
+
+          if primary_key:
+              headers = {"Content-Type": "application/json", "Authorization": f"Bearer {primary_key}"}
+              for attempt in range(3):
+                  req = urllib.request.Request(primary_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as response:
+                          result = json.loads(response.read().decode("utf-8"))
+                          llm_output = result["choices"][0]["message"]["content"]
+                          break
+                  except urllib.error.HTTPError as e:
+                      if e.code in [429, 503, 504]:
+                          sleep_time = (2 ** (attempt + 1)) + random.uniform(0.1, 1.0)
+                          print(f"::warning::Primary API overloaded (HTTP {e.code}). Sleeping {sleep_time:.2f}s...")
+                          time.sleep(sleep_time)
+                      else:
+                          print(f"::warning::Primary API failed: HTTP {e.code}")
+                          break
+                  except Exception as e:
+                      print(f"::warning::Primary network exception: {e}")
+                      break
+
+          # 4. Routing Engine (Fallback)
+          if not llm_output:
+              print("::warning::Failing over to OpenRouter Fallback...")
+              if fallback_key:
+                  # Swap to a highly stable Meta model and strip strict format requirements
+                  payload["model"] = "meta-llama/llama-3.1-8b-instruct:free"
+                  if "response_format" in payload:
+                      del payload["response_format"]
+                      
+                  headers = {"Content-Type": "application/json", "Authorization": f"Bearer {fallback_key}"}
+                  req = urllib.request.Request(fallback_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+                  try:
+                      with urllib.request.urlopen(req, timeout=45) as response:
+                          result = json.loads(response.read().decode("utf-8"))
+                          raw_output = result["choices"][0]["message"]["content"]
+                          # Strip out Markdown formatting that Open Source models often inject
+                          llm_output = raw_output.replace("```json", "").replace("```", "").strip()
+                  except Exception as e:
+                      print(f"::error::Fallback API failure: {e}")
+                      sys.exit(1)
+              else:
+                  print("::error::No Fallback key. System offline.")
+                  sys.exit(1)
+
+          # 5. Deterministic Evaluation
+          try:
+              analysis = json.loads(llm_output)
+              print(f"Red Team Reasoning: {analysis.get('reasoning')}")
+              
+              if analysis.get("is_vulnerable") is True:
+                  print(f"::error::Red Team identified a severity {analysis.get('severity')} flaw. Kill switch engaged.")
+                  sys.exit(1)
+              else:
+                  print("Code passed adversarial review.")
+                  sys.exit(0)
+          except Exception as e:
+              print(f"::error::JSON Parsing Error: {e} | Raw AI Output: {llm_output}")
+              sys.exit(1)
+          EOF
+          
+          python red_team.py
