@@ -22,7 +22,7 @@ jobs:
           FALLBACK_API_KEY: ${{ secrets.FALLBACK_API_KEY }}
           BASE_REF: origin/${{ github.base_ref }}
         run: |
-          python -c '
+          cat << 'EOF' > red_team.py
           import os, sys, json, time, random, urllib.request, urllib.error, subprocess
 
           # 1. Gather the PR Diff
@@ -110,4 +110,6 @@ jobs:
           else:
               print("Code passed adversarial review.")
               sys.exit(0)
-          '
+          EOF
+          
+          python red_team.py
